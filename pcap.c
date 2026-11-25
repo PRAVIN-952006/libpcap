@@ -547,6 +547,10 @@ pcapint_grow_buffer(pcap_t *p, u_int bufsize, char *errbuf)
 {
 	void *bigger_buffer;
 
+	if (bufsize == 0) {
+		snprintf(errbuf, PCAP_ERRBUF_SIZE, "invalid zero buffer size");
+		return (0);
+	}
 	bigger_buffer = realloc(p->buffer, bufsize);
 	if (bigger_buffer == NULL) {
 		snprintf(errbuf, PCAP_ERRBUF_SIZE, "out of memory");

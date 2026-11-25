@@ -1294,12 +1294,14 @@ daemon_msg_auth_req(struct daemon_slpars *pars, uint32_t plen)
 			status = rpcapd_recv(pars->sockctrl, pars->ssl, passwd, passwdlen, &plen, errmsgbuf);
 			if (status == -1)
 			{
+				for (volatile char *p = passwd; p < passwd + passwdlen + 1; p++) *p = 0;
 				free(username);
 				free(passwd);
 				return -1;
 			}
 			if (status == -2)
 			{
+				for (volatile char *p = passwd; p < passwd + passwdlen + 1; p++) *p = 0;
 				free(username);
 				free(passwd);
 				goto error;
@@ -1312,6 +1314,7 @@ daemon_msg_auth_req(struct daemon_slpars *pars, uint32_t plen)
 				// Authentication failed.  Let the client
 				// know.
 				//
+				for (volatile char *p = passwd; p < passwd + passwdlen + 1; p++) *p = 0;
 				free(username);
 				free(passwd);
 				if (rpcap_senderror(pars->sockctrl, pars->ssl,
@@ -1336,6 +1339,7 @@ daemon_msg_auth_req(struct daemon_slpars *pars, uint32_t plen)
 				goto error_noreply;
 			}
 
+			for (volatile char *p = passwd; p < passwd + passwdlen + 1; p++) *p = 0;
 			free(username);
 			free(passwd);
 			break;
@@ -2362,11 +2366,11 @@ daemon_unpackapplyfilter(PCAP_SOCKET sockctrl, SSL *ctrl_ssl, struct session *se
 		return -2;
 	}
 
-	if (bf_prog.bf_len > RPCAP_BPF_MAXINSNS)
+	if (bf_prog.bf_len == 0 || bf_prog.bf_len > RPCAP_BPF_MAXINSNS)
 	{
 		snprintf(errmsgbuf, PCAP_ERRBUF_SIZE,
-		    "Filter program is larger than the maximum size of %d instructions",
-		    RPCAP_BPF_MAXINSNS);
+		    "Filter program length (%u) must be between 1 and %d instructions",
+		    bf_prog.bf_len, RPCAP_BPF_MAXINSNS);
 		return -2;
 	}
 	bf_insn = (struct bpf_insn *) malloc (sizeof(struct bpf_insn) * bf_prog.bf_len);

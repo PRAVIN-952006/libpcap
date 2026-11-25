@@ -721,20 +721,24 @@ pcap_next_packet(pcap_t *p, struct pcap_pkthdr *hdr, u_char **data)
 			 */
 			u_int new_bufsize;
 
-			new_bufsize = hdr->caplen;
-			/*
-			 * https://graphics.stanford.edu/~seander/bithacks.html#RoundUpPowerOf2
-			 */
-			new_bufsize--;
-			new_bufsize |= new_bufsize >> 1;
-			new_bufsize |= new_bufsize >> 2;
-			new_bufsize |= new_bufsize >> 4;
-			new_bufsize |= new_bufsize >> 8;
-			new_bufsize |= new_bufsize >> 16;
-			new_bufsize++;
+			if (hdr->caplen > 0x80000000U) {
+				new_bufsize = (u_int)p->snapshot;
+			} else {
+				new_bufsize = hdr->caplen;
+				/*
+				 * https://graphics.stanford.edu/~seander/bithacks.html#RoundUpPowerOf2
+				 */
+				new_bufsize--;
+				new_bufsize |= new_bufsize >> 1;
+				new_bufsize |= new_bufsize >> 2;
+				new_bufsize |= new_bufsize >> 4;
+				new_bufsize |= new_bufsize >> 8;
+				new_bufsize |= new_bufsize >> 16;
+				new_bufsize++;
 
-			if (new_bufsize > (u_int)p->snapshot)
-				new_bufsize = p->snapshot;
+				if (new_bufsize == 0 || new_bufsize > (u_int)p->snapshot)
+					new_bufsize = (u_int)p->snapshot;
+			}
 
 			if (!pcapint_grow_buffer(p, new_bufsize, p->errbuf))
 				return (-1);

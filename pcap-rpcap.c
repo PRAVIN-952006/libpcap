@@ -2322,12 +2322,29 @@ static const char userinfo_allowed_symbols[] = "-._~!&'()*+,;=";
  * struct created from a username and password parsed out of the userinfo
  * portion of a URI.
  */
+static int rpcap_hex_nibble(char c)
+{
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
+static void rpcap_zeroize(void *p, size_t len)
+{
+	volatile unsigned char *vp = (volatile unsigned char *)p;
+	while (len--)
+		*vp++ = 0;
+}
+
 static int rpcap_doauth_userinfo(PCAP_SOCKET sockctrl, SSL *ssl, uint8_t *ver,
     int *byte_swapped, const char *userinfo, char *errbuf)
 {
 	struct pcap_rmtauth auth;
 	const char *ptr;
 	char *buf, username[256], password[256];
+	size_t pos = 0, limit = sizeof(username) - 1;
+	int ret;
 
 	auth.type = RPCAP_RMTAUTH_PWD;
 	auth.username = username;
@@ -2338,52 +2355,80 @@ static int rpcap_doauth_userinfo(PCAP_SOCKET sockctrl, SSL *ssl, uint8_t *ver,
 
 	if ((ptr = userinfo) != NULL)
 	{
-		// FIXME: 'pos' is not limited to the sizes of 'username' and 'password'.
-		for (int pos = -1; (buf[++pos] = *ptr) != '\0'; ++ptr)
+		for (; *ptr != '\0'; ++ptr)
 		{
-			/* handle %xx encoded characters */
-			if (*ptr == '%')
-			{
-				/* the pedantic thing to do here would be throwing an error on
-				 * a sequence like '%hi', however a lot of common tools just accept
-				 * such malarkey, so... probably it will be fine? */
-				if (sscanf(ptr, "%%%02hhx", (unsigned char *)(buf+pos)) == 1)
-					ptr += 2;
-				/* other implementations aside, rejecting null bytes seems prudent */
-				if (buf[pos] == '\0')
-				{
-					snprintf(errbuf, PCAP_ERRBUF_SIZE, "Invalid escape '%%00' in userinfo");
-					return -1;
-				}
-			}
-			else if (*ptr == ':' && buf == username)
+			if (*ptr == ':' && buf == username)
 			{
 				/* terminate username string and switch to password string */
 				buf[pos] = '\0';
 				buf = password;
-				pos = -1;
+				pos = 0;
+				limit = sizeof(password) - 1;
+				continue;
 			}
-			/* constrain to characters allowed by RFC3986 */
-			else if (*ptr >= 'A' && *ptr <= 'Z')
-				continue;
-			else if (*ptr >= 'a' && *ptr <= 'z')
-				continue;
-			else if (*ptr >= '0' && *ptr <= '9')
-				continue;
-			else if (*ptr < ' ' || *ptr > '~')
+
+			if (pos >= limit)
 			{
-				snprintf(errbuf, PCAP_ERRBUF_SIZE, "Invalid character '\\%o' in userinfo", *ptr);
+				snprintf(errbuf, PCAP_ERRBUF_SIZE,
+				    "%s in userinfo exceeds maximum length (%zu)",
+				    buf == username ? "Username" : "Password", limit);
+				rpcap_zeroize(password, sizeof(password));
 				return -1;
 			}
-			else if (strchr(userinfo_allowed_symbols, *ptr) == NULL)
+
+			/* handle %xx encoded characters without reading past NUL */
+			if (*ptr == '%')
 			{
-				snprintf(errbuf, PCAP_ERRBUF_SIZE, "Invalid character '%c' in userinfo", *ptr);
+				int hi = ptr[1] != '\0' ? rpcap_hex_nibble(ptr[1]) : -1;
+				int lo = (hi >= 0 && ptr[2] != '\0') ? rpcap_hex_nibble(ptr[2]) : -1;
+				if (hi < 0 || lo < 0)
+				{
+					snprintf(errbuf, PCAP_ERRBUF_SIZE,
+					    "Invalid percent-encoding in userinfo");
+					rpcap_zeroize(password, sizeof(password));
+					return -1;
+				}
+				unsigned char decoded = (unsigned char)((hi << 4) | lo);
+				if (decoded == 0)
+				{
+					snprintf(errbuf, PCAP_ERRBUF_SIZE,
+					    "Invalid escape '%%00' in userinfo");
+					rpcap_zeroize(password, sizeof(password));
+					return -1;
+				}
+				buf[pos++] = (char)decoded;
+				ptr += 2;
+			}
+			/* constrain to characters allowed by RFC3986 */
+			else if ((*ptr >= 'A' && *ptr <= 'Z') ||
+			    (*ptr >= 'a' && *ptr <= 'z') ||
+			    (*ptr >= '0' && *ptr <= '9') ||
+			    strchr(userinfo_allowed_symbols, *ptr) != NULL)
+			{
+				buf[pos++] = *ptr;
+			}
+			else if ((unsigned char)*ptr < ' ' || (unsigned char)*ptr > '~')
+			{
+				snprintf(errbuf, PCAP_ERRBUF_SIZE,
+				    "Invalid character '\\%o' in userinfo",
+				    (unsigned char)*ptr);
+				rpcap_zeroize(password, sizeof(password));
+				return -1;
+			}
+			else
+			{
+				snprintf(errbuf, PCAP_ERRBUF_SIZE,
+				    "Invalid character '%c' in userinfo", *ptr);
+				rpcap_zeroize(password, sizeof(password));
 				return -1;
 			}
 		}
+		buf[pos] = '\0';
 
-		return rpcap_doauth(sockctrl, ssl, ver, byte_swapped, &auth,
+		ret = rpcap_doauth(sockctrl, ssl, ver, byte_swapped, &auth,
 		    errbuf);
+		rpcap_zeroize(password, sizeof(password));
+		return ret;
 	}
 
 	return rpcap_doauth(sockctrl, ssl, ver, byte_swapped, NULL, errbuf);
@@ -3422,8 +3467,15 @@ void pcap_remoteact_cleanup(void)
 int pcap_remoteact_list(char *hostlist, char sep, int size, char *errbuf)
 {
 	struct activehosts *temp;	/* temp var needed to scan the host list chain */
-	size_t len;
+	size_t len, hostlen;
 	char hoststr[RPCAP_HOSTLIST_SIZE + 1];
+
+	if (hostlist == NULL || size <= 0)
+	{
+		snprintf(errbuf, PCAP_ERRBUF_SIZE,
+		    "Invalid hostlist buffer or size (%d)", size);
+		return -1;
+	}
 
 	temp = activeHosts;
 
@@ -3432,29 +3484,23 @@ int pcap_remoteact_list(char *hostlist, char sep, int size, char *errbuf)
 
 	while (temp)
 	{
-		/*int sock_getascii_addrport(const struct sockaddr_storage *sockaddr, char *address, int addrlen, char *port, int portlen, int flags, char *errbuf, int errbuflen) */
-
 		/* Get the numeric form of the name of the connecting host */
 		if (sock_getascii_addrport((struct sockaddr_storage *) &temp->host, hoststr,
 			RPCAP_HOSTLIST_SIZE, NULL, 0, NI_NUMERICHOST, errbuf, PCAP_ERRBUF_SIZE) != -1)
-			/*	if (getnameinfo( (struct sockaddr *) &temp->host, sizeof (struct sockaddr_storage), hoststr, */
-			/*		RPCAP_HOSTLIST_SIZE, NULL, 0, NI_NUMERICHOST) ) */
 		{
-			/*	sock_geterrmsg(errbuf, PCAP_ERRBUF_SIZE, */
-			/*	    "getnameinfo() failed");             */
 			return -1;
 		}
 
-		len = len + strlen(hoststr) + 1 /* the separator */;
-
-		if ((size < 0) || (len >= (size_t)size))
+		hostlen = strlen(hoststr);
+		if (hostlen >= (size_t)size - len || len + hostlen + 1 >= (size_t)size)
 		{
 			snprintf(errbuf, PCAP_ERRBUF_SIZE, "The string you provided is not able to keep "
 				"the hostnames for all the active connections");
 			return -1;
 		}
 
-		pcapint_strlcat(hostlist, hoststr, PCAP_ERRBUF_SIZE);
+		memcpy(hostlist + len, hoststr, hostlen);
+		len += hostlen + 1; /* the separator */
 		hostlist[len - 1] = sep;
 		hostlist[len] = 0;
 
